@@ -11,8 +11,8 @@ from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
 	QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-	QMainWindow, QPushButton, QProgressBar, QSpinBox, QStatusBar, QVBoxLayout,
-	QWidget,
+	QMainWindow, QPushButton, QProgressBar, QSpinBox, QDoubleSpinBox,
+	QStatusBar, QVBoxLayout, QWidget, QSizePolicy, QScrollArea,
 )
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -31,6 +31,8 @@ class ExtractOptions:
 	every_n: int
 	fmt: str
 	jpg_quality: int
+	start_frame: int
+	end_frame: int
 
 
 class GLFrameCanvas(QOpenGLWidget):
@@ -131,6 +133,10 @@ class ExtractWorker(QObject):
 		self.video_path = video_path
 		self.output_dir = output_dir
 		self.options = options
+		self._stop = False
+
+	def stop(self):
+		self._stop = True
 
 	def run(self):
 		cap = cv2.VideoCapture(self.video_path)
@@ -139,20 +145,34 @@ class ExtractWorker(QObject):
 			return
 
 		total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-		idx = 0
+		start = max(0, self.options.start_frame)
+		end = self.options.end_frame
+		if total > 0:
+			last = total - 1
+			end = last if end <= 0 or end > last else end
+		if end < start:
+			start, end = end, start
+
+		idx = start
+		cap.set(cv2.CAP_PROP_POS_FRAMES, start)
 		saved = 0
-		while True:
+		while idx <= end:
+			if self._stop:
+				break
 			ok, frame = cap.read()
 			if not ok:
 				break
-			if idx % self.options.every_n == 0:
+			if (idx - start) % self.options.every_n == 0:
 				if self._save_frame(frame, idx):
 					saved += 1
 			idx += 1
 			if total:
 				self.progress.emit(idx, total)
 		cap.release()
-		self.finished.emit(f"Saved {saved} frames to {self.output_dir}")
+		if self._stop:
+			self.finished.emit(f"Extraction cancelled. Saved {saved} frames to {self.output_dir}")
+		else:
+			self.finished.emit(f"Saved {saved} frames to {self.output_dir}")
 
 	def _save_frame(self, frame: np.ndarray, idx: int) -> bool:
 		os.makedirs(self.output_dir, exist_ok=True)
@@ -177,6 +197,7 @@ class FrameExtractor(QMainWindow):
 		self.current_frame_index = 0
 		self.frames_per_step = 20
 		self.total_frames = 0
+		self.fps = 0.0
 		self.cap: cv2.VideoCapture | None = None
 		self.current_frame: np.ndarray | None = None
 
@@ -197,27 +218,61 @@ class FrameExtractor(QMainWindow):
 		main_layout.setContentsMargins(6, 6, 6, 6)
 
 		left = QWidget()
-		left.setFixedWidth(280)
+		left.setFixedWidth(320)
+		left.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 		ll = QVBoxLayout(left)
-		ll.setSpacing(8)
+		ll.setSpacing(6)
+		ll.setContentsMargins(6, 6, 6, 6)
 
-		sg = QGroupBox("Sources")
+		scroll = QScrollArea()
+		scroll.setWidgetResizable(True)
+		scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+		scroll_content = QWidget()
+		scroll_layout = QVBoxLayout(scroll_content)
+		scroll_layout.setSpacing(10)
+		scroll_layout.setContentsMargins(0, 0, 0, 0)
+
+		def _polish_button(btn: QPushButton):
+			btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+			btn.setMinimumHeight(28)
+
+		def _make_section(title: str, content: QWidget, tight: bool = False) -> QGroupBox:
+			box = QGroupBox(title)
+			box.setCheckable(True)
+			box.setChecked(True)
+			box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+			layout = QVBoxLayout(box)
+			if tight:
+				layout.setContentsMargins(6, 4, 6, 6)
+				layout.setSpacing(6)
+			layout.addWidget(content)
+			content.setVisible(True)
+			box.toggled.connect(content.setVisible)
+			return box
+
+		sg = QWidget()
 		sl = QVBoxLayout(sg)
+		sl.setContentsMargins(4, 4, 4, 4)
+		sl.setSpacing(6)
 		self._input_label = QLabel("")
 		self._input_label.setWordWrap(True)
+		self._input_label.setStyleSheet("font-size: 10px; color: #aaa;")
 		self._output_label = QLabel("")
 		self._output_label.setWordWrap(True)
+		self._output_label.setStyleSheet("font-size: 10px; color: #aaa;")
 		b_in = QPushButton("Open Video Folder...")
+		_polish_button(b_in)
 		b_in.clicked.connect(self._select_input_folder)
 		b_out = QPushButton("Select Output Folder...")
+		_polish_button(b_out)
 		b_out.clicked.connect(self._select_output_folder)
 		sl.addWidget(b_in)
 		sl.addWidget(b_out)
 		sl.addWidget(self._input_label)
 		sl.addWidget(self._output_label)
-		ll.addWidget(sg)
+		section_sources = _make_section("Sources", sg, tight=True)
 
-		vg = QGroupBox("Video")
+		vg = QWidget()
 		vl = QVBoxLayout(vg)
 		self._video_combo = QComboBox()
 		self._video_combo.currentIndexChanged.connect(self._on_video_selected)
@@ -228,19 +283,35 @@ class FrameExtractor(QMainWindow):
 		self._step_spin.setRange(1, 10000)
 		self._step_spin.setValue(self.frames_per_step)
 		self._step_spin.valueChanged.connect(self._on_step_changed)
+		self._time_unit = QComboBox()
+		self._time_unit.addItems(["Frames", "Seconds", "Milliseconds"])
+		self._time_unit.currentIndexChanged.connect(self._on_time_unit_changed)
+		self._step_seconds = QDoubleSpinBox()
+		self._step_seconds.setRange(0.001, 3600.0)
+		self._step_seconds.setDecimals(3)
+		self._step_seconds.setSingleStep(0.1)
+		self._step_seconds.setValue(1.0)
+		self._step_seconds.valueChanged.connect(self._on_step_seconds_changed)
+		self._step_seconds.setEnabled(False)
 		vl.addWidget(QLabel("Select Video:"))
 		vl.addWidget(self._video_combo)
 		vl.addWidget(self._video_label)
 		vl.addWidget(self._frame_label)
+		vl.addWidget(QLabel("Step unit:"))
+		vl.addWidget(self._time_unit)
 		vl.addWidget(QLabel("Frames per step:"))
 		vl.addWidget(self._step_spin)
-		ll.addWidget(vg)
+		vl.addWidget(QLabel("Time step:"))
+		vl.addWidget(self._step_seconds)
+		section_video = _make_section("Video", vg)
 
-		ng = QGroupBox("Navigation")
+		ng = QWidget()
 		nl = QVBoxLayout(ng)
 		row = QHBoxLayout()
 		b_prev = QPushButton("◀ Prev Frame")
 		b_next = QPushButton("Next Frame ▶")
+		_polish_button(b_prev)
+		_polish_button(b_next)
 		b_prev.clicked.connect(self._prev_frame)
 		b_next.clicked.connect(self._next_frame)
 		row.addWidget(b_prev)
@@ -248,37 +319,63 @@ class FrameExtractor(QMainWindow):
 		nl.addLayout(row)
 		b_prev_v = QPushButton("⏮ Prev Video")
 		b_next_v = QPushButton("Next Video ⏭")
+		_polish_button(b_prev_v)
+		_polish_button(b_next_v)
 		b_prev_v.clicked.connect(self._prev_video)
 		b_next_v.clicked.connect(self._next_video)
 		nl.addWidget(b_prev_v)
 		nl.addWidget(b_next_v)
 		b_save = QPushButton("Save Current Frame")
+		_polish_button(b_save)
 		b_save.clicked.connect(self._save_current_frame)
 		nl.addWidget(b_save)
-		ll.addWidget(ng)
+		section_nav = _make_section("Navigation", ng)
 
-		eg = QGroupBox("Auto Extract")
+		eg = QWidget()
 		el = QVBoxLayout(eg)
 		self._every_spin = QSpinBox()
 		self._every_spin.setRange(1, 10000)
 		self._every_spin.setValue(30)
+		self._range_start = QSpinBox()
+		self._range_start.setRange(0, 1_000_000_000)
+		self._range_start.setValue(0)
+		self._range_end = QSpinBox()
+		self._range_end.setRange(0, 1_000_000_000)
+		self._range_end.setValue(0)
 		self._format_combo = QComboBox()
 		self._format_combo.addItems(["PNG (lossless)", "JPG (quality 100)"])
 		self._format_combo.currentIndexChanged.connect(self._on_format_changed)
 		self._jpg_quality = 100
-		b_extract = QPushButton("Extract Every N Frames")
-		b_extract.clicked.connect(self._extract_every_n)
+		self._extract_btn = QPushButton("Extract Every N Frames")
+		_polish_button(self._extract_btn)
+		self._extract_btn.clicked.connect(self._extract_every_n)
+		self._stop_extract = QPushButton("Stop Extraction")
+		_polish_button(self._stop_extract)
+		self._stop_extract.setEnabled(False)
+		self._stop_extract.clicked.connect(self._cancel_extract)
 		self._progress = QProgressBar()
 		self._progress.setRange(0, 100)
 		self._progress.setValue(0)
 		el.addWidget(QLabel("Every N frames:"))
 		el.addWidget(self._every_spin)
+		el.addWidget(QLabel("Start frame (0 = first):"))
+		el.addWidget(self._range_start)
+		el.addWidget(QLabel("End frame (0 = last):"))
+		el.addWidget(self._range_end)
 		el.addWidget(QLabel("Save format:"))
 		el.addWidget(self._format_combo)
-		el.addWidget(b_extract)
+		el.addWidget(self._extract_btn)
+		el.addWidget(self._stop_extract)
 		el.addWidget(self._progress)
-		ll.addWidget(eg)
-		ll.addStretch()
+		section_extract = _make_section("Auto Extract", eg)
+
+		scroll_layout.addWidget(section_sources)
+		scroll_layout.addWidget(section_video)
+		scroll_layout.addWidget(section_nav)
+		scroll_layout.addWidget(section_extract)
+		scroll_layout.addStretch()
+		scroll.setWidget(scroll_content)
+		ll.addWidget(scroll)
 
 		self.canvas = GLFrameCanvas(self)
 		main_layout.addWidget(left)
@@ -349,6 +446,7 @@ class FrameExtractor(QMainWindow):
 			self.statusBar().showMessage(f"Failed to open {os.path.basename(path)}", 4000)
 			return
 		self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+		self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
 		self.current_frame_index = 0
 		self._read_frame(self.current_frame_index)
 		self._update_video_labels()
@@ -375,7 +473,16 @@ class FrameExtractor(QMainWindow):
 		name = os.path.basename(self.video_paths[self.current_video_index])
 		total = self.total_frames if self.total_frames else "?"
 		self._video_label.setText(name)
-		self._frame_label.setText(f"Frame: {self.current_frame_index} / {total}")
+		if self._time_unit.currentIndex() == 0 or self.fps <= 0:
+			self._frame_label.setText(f"Frame: {self.current_frame_index} / {total}")
+		elif self._time_unit.currentIndex() == 1:
+			cur = self.current_frame_index / self.fps
+			end = (self.total_frames - 1) / self.fps if self.total_frames else 0
+			self._frame_label.setText(f"Time: {cur:.3f}s / {end:.3f}s")
+		else:
+			cur = self.current_frame_index / self.fps * 1000.0
+			end = (self.total_frames - 1) / self.fps * 1000.0 if self.total_frames else 0
+			self._frame_label.setText(f"Time: {cur:.1f}ms / {end:.1f}ms")
 
 	def _on_video_selected(self, index: int):
 		if index >= 0:
@@ -383,6 +490,16 @@ class FrameExtractor(QMainWindow):
 
 	def _on_step_changed(self, v: int):
 		self.frames_per_step = v
+
+	def _on_step_seconds_changed(self, v: float):
+		# value stored in widget; conversion happens on step
+		pass
+
+	def _on_time_unit_changed(self, idx: int):
+		is_frames = idx == 0
+		self._step_spin.setEnabled(is_frames)
+		self._step_seconds.setEnabled(not is_frames)
+		self._update_video_labels()
 
 	def _on_format_changed(self):
 		# quality fixed to 100 for no visible loss
@@ -393,12 +510,39 @@ class FrameExtractor(QMainWindow):
 	def _prev_frame(self):
 		if self.current_video_index < 0:
 			return
-		self._read_frame(self.current_frame_index - self.frames_per_step)
+		self._step(-1)
 
 	def _next_frame(self):
 		if self.current_video_index < 0:
 			return
-		self._read_frame(self.current_frame_index + self.frames_per_step)
+		self._step(1)
+
+	def _step(self, direction: int):
+		if self.total_frames <= 0:
+			delta = self.frames_per_step if direction > 0 else -self.frames_per_step
+			self._read_frame(self.current_frame_index + delta)
+			return
+
+		last = self.total_frames - 1
+		if self._time_unit.currentIndex() == 0 or self.fps <= 0:
+			step = self.frames_per_step
+		else:
+			seconds = float(self._step_seconds.value())
+			if self._time_unit.currentIndex() == 2:
+				seconds = seconds / 1000.0
+			step = max(1, int(round(seconds * self.fps)))
+
+		if direction > 0:
+			if self.current_frame_index == last:
+				target = 0
+			else:
+				target = min(self.current_frame_index + step, last)
+		else:
+			if self.current_frame_index == 0:
+				target = last
+			else:
+				target = max(self.current_frame_index - step, 0)
+		self._read_frame(target)
 
 	def _prev_video(self):
 		if self.current_video_index > 0:
@@ -435,11 +579,29 @@ class FrameExtractor(QMainWindow):
 	def _extract_every_n(self):
 		if self.current_video_index < 0:
 			return
+		if self._extract_thread is not None and self._extract_thread.isRunning():
+			return
 		every_n = int(self._every_spin.value())
 		fmt = "png" if self._format_combo.currentIndex() == 0 else "jpg"
 		out_dir = self._current_video_output_dir()
+		start = int(self._range_start.value())
+		end = int(self._range_end.value())
+		if self.total_frames > 0:
+			last = self.total_frames - 1
+			if start <= 0:
+				start = 0
+			if end <= 0 or end > last:
+				end = last
+			if start > end:
+				start, end = end, start
 
-		options = ExtractOptions(every_n=every_n, fmt=fmt, jpg_quality=self._jpg_quality)
+		options = ExtractOptions(
+			every_n=every_n,
+			fmt=fmt,
+			jpg_quality=self._jpg_quality,
+			start_frame=start,
+			end_frame=end,
+		)
 		self._extract_worker = ExtractWorker(self.video_paths[self.current_video_index], out_dir, options)
 		self._extract_thread = QThread()
 		self._extract_worker.moveToThread(self._extract_thread)
@@ -451,8 +613,14 @@ class FrameExtractor(QMainWindow):
 		self._extract_worker.finished.connect(self._extract_worker.deleteLater)
 		self._extract_thread.finished.connect(self._extract_thread.deleteLater)
 		self._progress.setValue(0)
+		self._extract_btn.setEnabled(False)
+		self._stop_extract.setEnabled(True)
 		self.statusBar().showMessage("Extracting frames...")
 		self._extract_thread.start()
+
+	def _cancel_extract(self):
+		if self._extract_worker is not None:
+			self._extract_worker.stop()
 
 	def _on_extract_progress(self, current: int, total: int):
 		if total <= 0:
@@ -463,9 +631,13 @@ class FrameExtractor(QMainWindow):
 	def _on_extract_finished(self, msg: str):
 		self._progress.setValue(100)
 		self.statusBar().showMessage(msg, 4000)
+		self._extract_btn.setEnabled(True)
+		self._stop_extract.setEnabled(False)
 
 	def _on_extract_error(self, msg: str):
 		self.statusBar().showMessage(msg, 5000)
+		self._extract_btn.setEnabled(True)
+		self._stop_extract.setEnabled(False)
 
 	def closeEvent(self, event):
 		if self.cap is not None:
